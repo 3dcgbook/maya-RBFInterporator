@@ -1,4 +1,4 @@
-#include "Node.hpp"
+#include "RbfInterporator.hpp"
 #include <maya/MFnPlugin.h>
 
 MStatus initializePlugin(MObject obj)
