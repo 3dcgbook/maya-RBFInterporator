@@ -15,6 +15,8 @@
 #include <maya/MStatus.h>
 #include <maya/MArrayDataHandle.h>
 #include <iostream>
+#include <maya/MEvaluationNode.h>
+#include <maya/MEvaluationManager.h>
 using Eigen::MatrixXd;
 using Eigen::VectorXd;
 using Eigen::PartialPivLU;
@@ -38,9 +40,6 @@ MObject RbfInterporatorNode::aInFeatureBaseX;
 MObject RbfInterporatorNode::aInFeatureBaseY;
 MObject RbfInterporatorNode::aInFeatureBaseZ;
 MObject RbfInterporatorNode::aInFeatureOut;
-
-RbfInterporatorNode::RbfInterporatorNode() {}
-RbfInterporatorNode::~RbfInterporatorNode() {}
 
 rbf::RbfInterpolator::RbfInterpolator(const std::function<double(const double)>& rbf_kernel)
 	: m_rbf_kernel(rbf_kernel)
@@ -109,6 +108,41 @@ inline double rbf::RbfInterpolator::GetWeights(const int& i) const
 	return m_w(i);
 }
 
+RbfInterporatorNode::RbfInterporatorNode()
+	: valueDirty(true)
+{
+}
+
+RbfInterporatorNode::~RbfInterporatorNode()
+{
+}
+
+MStatus RbfInterporatorNode::setDependentsDirty(const MPlug& plug, MPlugArray& plugArray)
+{
+	const MPlug dirtyPlug = plug.isChild() ? plug.parent() : plug;
+	if (dirtyPlug == aInNormalized || dirtyPlug == aInRbfType || dirtyPlug == aInLambda || dirtyPlug == aInRadius) 
+	{
+		//MGlobal::displayInfo("setDependentsDirty: " + dirtyPlug.name());
+		valueDirty = true;
+	}
+	return MPxNode::setDependentsDirty(plug, plugArray);
+}
+
+MStatus RbfInterporatorNode::preEvaluation(const MDGContext& context, const MEvaluationNode& evalNode)
+{
+	if (!valueDirty)
+	{
+		for (MEvaluationNodeIterator it = evalNode.iterator(); !it.isDone(); it.next()) {
+			MPlug dirtyPlug = it.plug();
+			if (dirtyPlug == aInPosition || dirtyPlug == aInFeatures) {
+				//MGlobal::displayInfo("PreEval: " + dirtyPlug.name());
+				valueDirty = true;
+			}
+		}
+	}
+	return MS::kSuccess;
+}
+
 MStatus RbfInterporatorNode::initialize()
 {
 	MStatus stat;
@@ -144,6 +178,8 @@ MStatus RbfInterporatorNode::initialize()
 	fnComp.addChild(aOutBaseWeight);
 	fnComp.addChild(aOutRBFWeight);
 	fnComp.setArray(true);
+	fnComp.setWritable(false);
+	fnComp.setStorable(false);
 
 	// コンパウンド型インプットのテスト用
 	aInFeatureBaseX = fnUnit.create("FeatureX", "fx", MFnUnitAttribute::kDistance, 0.0, &stat);
@@ -188,7 +224,7 @@ MStatus RbfInterporatorNode::initialize()
 MStatus RbfInterporatorNode::compute(const MPlug& plug, MDataBlock& data)
 {	
 	MStatus status;
-
+	double3& inpos = data.inputValue(aInPosition).asDouble3();
 	MArrayDataHandle outArryHandle(data.outputArrayValue(aOutWeights));
 	unsigned out_count = outArryHandle.elementCount();
 	if (out_count == 0)
@@ -206,71 +242,72 @@ MStatus RbfInterporatorNode::compute(const MPlug& plug, MDataBlock& data)
 	short rbftype = data.inputValue(aInRbfType).asShort();
 	double lambda = data.inputValue(aInLambda).asDouble();
 	double radius = data.inputValue(aInRadius).asDouble();
-	//char moji[256];
-	//MGlobal::displayInfo("\n");
 
-	MatrixXd X(3, feature_count);
-	Eigen::VectorXd y(feature_count);
+
+	if (valueDirty) {
+		//MGlobal::displayInfo("Compute Dirty");
+		MatrixXd X(3, feature_count);
+		VectorXd y(feature_count);
 	
-	for (unsigned i = 0; i < feature_count; i++) {
-		featureArryHandle.jumpToElement(i);
+		for (unsigned i = 0; i < feature_count; i++) {
+			featureArryHandle.jumpToElement(i);
 
-		// XYZのプロット値の取得
-		double3& position = featureArryHandle.inputValue(&status).child(aInFeatureBase).asDouble3();
-		Eigen::Vector3d eg_pos = Eigen::Vector3d(position[0], position[1], position[2]);
-		if (isNormalized)
-			eg_pos.normalize();
-		Eigen::Index column = i * X.rows();
-		X(column) = eg_pos(0);
-		X(column + 1) = eg_pos(1);
-		X(column + 2) = eg_pos(2);
+			// XYZのプロット値の取得
+			double3& position = featureArryHandle.inputValue(&status).child(aInFeatureBase).asDouble3();
+			Eigen::Vector3d eg_pos = Eigen::Vector3d(position[0], position[1], position[2]);
+			if (isNormalized)
+				eg_pos.normalize();
+			Eigen::Index column = i * X.rows();
+			X(column) = eg_pos(0);
+			X(column + 1) = eg_pos(1);
+			X(column + 2) = eg_pos(2);
 
-		// プロット結果の取得
-		y(i) = featureArryHandle.inputValue(&status).child(aInFeatureOut).asDouble();
-		Eigen::Vector3d ePosition = Eigen::Vector3d(position[0], position[1], position[2]);
-	}
+			// プロット結果の取得
+			y(i) = featureArryHandle.inputValue(&status).child(aInFeatureOut).asDouble();
+			Eigen::Vector3d ePosition = Eigen::Vector3d(position[0], position[1], position[2]);
+		}
+		// RBF Interporationの実装
+		const auto kernel = rbf::GaussianRbfKernel(radius);
+		constexpr bool use_regularization = true;
+		pRbf.SetRbfKernel(kernel);
 
-	// RBF Interporationの実装
-	const auto kernel = rbf::GaussianRbfKernel(radius);
-	constexpr bool use_regularization = true;
-
-	rbf::RbfInterpolator rbf_interpolator(kernel);
-	switch (rbftype)
-	{
-	case 0:
-		MGlobal::displayInfo("LinearRbfKernel");
-		rbf_interpolator.SetRbfKernel(rbf::LinearRbfKernel());
-		break;
-	case 1:
-		rbf_interpolator.SetRbfKernel(rbf::GaussianRbfKernel(radius));
-		break;
-	case 2:
-		rbf_interpolator.SetRbfKernel(rbf::ThinPlateSplineRbfKernel());
-		break;
-	case 3:
-		rbf_interpolator.SetRbfKernel(rbf::InverseQuadraticRbfKernel());
-		break;
-	default:
-		break;
+		switch (rbftype)
+		{
+		case 0:
+			pRbf.SetRbfKernel(rbf::LinearRbfKernel());
+			break;
+		case 1:
+			pRbf.SetRbfKernel(rbf::GaussianRbfKernel(radius));
+			break;
+		case 2:
+			pRbf.SetRbfKernel(rbf::ThinPlateSplineRbfKernel());
+			break;
+		case 3:
+			pRbf.SetRbfKernel(rbf::InverseQuadraticRbfKernel());
+			break;
+		default:
+			break;
+		}
+		pRbf.SetData(X, y);
+		pRbf.CalcWeights(use_regularization, lambda);
+		valueDirty = false;
 	}
 	
-	rbf_interpolator.SetData(X, y);
-	rbf_interpolator.CalcWeights(use_regularization, lambda);
-
-	double3& inpos = data.inputValue(aInPosition).asDouble3();
 	Eigen::Vector3d input_x = Eigen::Vector3d(inpos[0], inpos[1], inpos[2]);
 	if (isNormalized)
 		input_x.normalize();
-	double yy = rbf_interpolator.CalcValue(input_x);
-	
+	double yy = pRbf.CalcValue(input_x);
+	//char moji[256];
+	//sprintf_s(moji, "CalculateOut : %f", inpos[0]);
+	//MGlobal::displayInfo(moji);
 	for (unsigned i = 0; i < out_count; i++) {
 		outArryHandle.jumpToElement(i);
-		outArryHandle.outputValue(&status).child(aOutRBFWeight).setDouble(rbf_interpolator.CalcSingleValue(input_x, i));
-		outArryHandle.outputValue(&status).child(aOutBaseWeight).setDouble(rbf_interpolator.GetWeights(i));
+		outArryHandle.outputValue(&status).child(aOutRBFWeight).setDouble(pRbf.CalcSingleValue(input_x, i));
+		outArryHandle.outputValue(&status).child(aOutBaseWeight).setDouble(pRbf.GetWeights(i));
 		outArryHandle.setClean();
 	}
-
 	data.outputValue(aOutCalculate).setDouble(yy);
+	data.setClean(plug);
 	return MS::kSuccess;
 }
 
